@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "search-txt-md"
+version = "0.1.0"
+description = "Index and boolean-search local podcast .txt/.md transcripts via SQLite FTS5"
+requires-python = ">=3.14"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[project.scripts]
+txtmd-index = "search_txt_md.cli:index_main"
+txtmd-search = "search_txt_md.cli:search_main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/search_txt_md"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/search_txt_md/schema.sql" = "search_txt_md/schema.sql"
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

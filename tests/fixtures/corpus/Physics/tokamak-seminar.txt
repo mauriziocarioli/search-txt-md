@@ -1,0 +1,4 @@
+Title: tokamak seminar
+URL: https://example.com/tokamak
+
+A seminar on plasma confinement in a tokamak reactor.
