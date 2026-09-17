@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-_FIELD_NAMES = {"title", "path", "folder", "body"}
+_FIELD_NAMES = {"title", "path", "folder", "body", "tag"}
 _FIELD_TO_COL = {"title": "title", "path": "stem", "folder": "folder", "body": "body"}
 _BAD_WORD_CHARS = frozenset("{}^;")
 _OPERATORS = {"and": "AND", "or": "OR", "not": "NOT"}
@@ -16,7 +16,7 @@ class QuerySyntaxError(ValueError):
 class Term:
     value: str
     kind: str  # "word" | "phrase" | "prefix"
-    field: str | None  # None or "title"|"path"|"folder"|"body"
+    field: str | None  # None or "title"|"path"|"folder"|"body"|"tag"
 
 
 @dataclass(frozen=True)
@@ -35,7 +35,14 @@ class Not:
     right: Node
 
 
-Node = Term | And | Or | Not
+@dataclass(frozen=True)
+class TagNot:
+    """Unary NOT for tag predicates (NOT EXISTS). Produced by partition, not the parser."""
+
+    child: Node
+
+
+Node = Term | And | Or | Not | TagNot
 
 
 @dataclass(frozen=True)
@@ -44,7 +51,10 @@ class ParsedQuery:
     default_op: str
 
     def to_fts5(self) -> str:
-        return _emit(self.ast)
+        fts_ast, _tag_ast = partition(self.ast)
+        if fts_ast is None:
+            raise QuerySyntaxError("query has no keyword terms")
+        return _emit(fts_ast)
 
 
 @dataclass(frozen=True)
@@ -222,6 +232,8 @@ class _Parser:
             field = self.expect("WORD").value.lower()
             self.expect("COLON")
             term = self.parse_term()
+            if field == "tag" and term.kind != "word":
+                raise QuerySyntaxError("tag: requires a word, not a phrase or prefix")
             return Term(term.value, term.kind, field)
         return self.parse_term()
 
@@ -285,6 +297,8 @@ def _quote(value: str) -> str:
 
 
 def _emit_term(term: Term) -> str:
+    if term.field == "tag":
+        raise QuerySyntaxError("tag: cannot be emitted as FTS5")
     if term.kind != "phrase" and is_bareword(term.value):
         tok = term.value
     else:
@@ -312,4 +326,110 @@ def _emit(node: Node) -> str:
         return " OR ".join(_atom(c) for c in node.children)
     if isinstance(node, Not):
         return f"{_atom(node.left)} NOT {_atom(node.right)}"
+    if isinstance(node, TagNot):
+        raise TypeError("TagNot cannot be emitted as FTS5")
     raise TypeError(f"unknown node {type(node)!r}")
+
+
+_MIXED_OR = "cannot OR a tag: filter with a keyword; AND them or OR tags with each other"
+_MIXED_NOT = "NOT cannot mix a tag: filter with a keyword on the right"
+_NOT_KEYWORD = "NOT requires a keyword term to the left when excluding a keyword"
+
+
+def _and_nodes(nodes: list[Node]) -> Node | None:
+    if not nodes:
+        return None
+    if len(nodes) == 1:
+        return nodes[0]
+    return And(tuple(nodes))
+
+
+def _or_nodes(nodes: list[Node]) -> Node | None:
+    if not nodes:
+        return None
+    if len(nodes) == 1:
+        return nodes[0]
+    return Or(tuple(nodes))
+
+
+def partition(node: Node) -> tuple[Node | None, Node | None]:
+    """Split an AST into (fts_ast, tag_ast). Either side may be None."""
+    if isinstance(node, TagNot):
+        fts, tag = partition(node.child)
+        if fts is not None:
+            raise QuerySyntaxError(_MIXED_NOT)
+        if tag is None:
+            return None, None
+        return None, TagNot(tag)
+    if isinstance(node, Term):
+        if node.field == "tag":
+            return None, node
+        return node, None
+    if isinstance(node, And):
+        fts_parts: list[Node] = []
+        tag_parts: list[Node] = []
+        for child in node.children:
+            fts, tag = partition(child)
+            if fts is not None:
+                fts_parts.append(fts)
+            if tag is not None:
+                tag_parts.append(tag)
+        return _and_nodes(fts_parts), _and_nodes(tag_parts)
+    if isinstance(node, Or):
+        parts = [partition(child) for child in node.children]
+        if any(f is not None and t is not None for f, t in parts):
+            raise QuerySyntaxError(_MIXED_OR)
+        has_fts = any(f is not None for f, _t in parts)
+        has_tag = any(t is not None for _f, t in parts)
+        if has_fts and has_tag:
+            raise QuerySyntaxError(_MIXED_OR)
+        if has_fts:
+            return _or_nodes([f for f, _t in parts if f is not None]), None
+        return None, _or_nodes([t for _f, t in parts if t is not None])
+    if isinstance(node, Not):
+        lf, lt = partition(node.left)
+        rf, rt = partition(node.right)
+        if rf is not None and rt is not None:
+            raise QuerySyntaxError(_MIXED_NOT)
+        if rf is not None:
+            if lf is None:
+                raise QuerySyntaxError(_NOT_KEYWORD)
+            return Not(lf, rf), lt
+        if rt is None:
+            return lf, lt
+        if lt is None:
+            return lf, TagNot(rt)
+        return lf, Not(lt, rt)
+    raise TypeError(f"unknown node {type(node)!r}")
+
+
+@dataclass(frozen=True)
+class CompiledQuery:
+    ast: Node
+    default_op: str
+    fts5: str | None
+    tags: Node | None
+
+    @property
+    def has_fts(self) -> bool:
+        return self.fts5 is not None
+
+    @property
+    def has_tags(self) -> bool:
+        return self.tags is not None
+
+
+def compile_query(text: str, *, default_op: str = "AND") -> CompiledQuery:
+    parsed = parse_query(text, default_op=default_op)
+    fts_ast, tag_ast = partition(parsed.ast)
+    fts5 = _emit(fts_ast) if fts_ast is not None else None
+    return CompiledQuery(ast=parsed.ast, default_op=parsed.default_op, fts5=fts5, tags=tag_ast)
+
+
+def and_tag_terms(tag_ast: Node | None, names: list[str]) -> Node | None:
+    extra = [Term(n, "word", "tag") for n in names]
+    if not extra:
+        return tag_ast
+    if tag_ast is None:
+        return extra[0] if len(extra) == 1 else And(tuple(extra))
+    return And((tag_ast, *extra))

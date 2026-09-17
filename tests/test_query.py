@@ -12,8 +12,11 @@ from search_txt_md.query import (
     Not,
     Or,
     QuerySyntaxError,
+    TagNot,
     Term,
+    compile_query,
     parse_query,
+    partition,
 )
 
 assert "sqlite3" not in inspect.getsource(query_mod)
@@ -76,6 +79,8 @@ ERRORS = [
     ("^grusch", "AND"),
     ("{title}", "AND"),
     ('"unclosed', "AND"),
+    ('tag:"a b"', "AND"),
+    ("tag:foo*", "AND"),
 ]
 
 
@@ -115,6 +120,40 @@ def test_mixed_not_hits() -> None:
     rows = {r[0] for r in conn.execute("SELECT rowid FROM t WHERE t MATCH :q", {"q": q})}
     assert 1 in rows
     assert 2 not in rows
+
+
+def test_compile_tag_only() -> None:
+    c = compile_query("tag:ufo")
+    assert c.fts5 is None
+    assert c.tags == Term("ufo", "word", "tag")
+    with pytest.raises(QuerySyntaxError, match="no keyword"):
+        parse_query("tag:ufo").to_fts5()
+
+
+def test_compile_tag_and_keyword() -> None:
+    c = compile_query("tag:ufo grusch")
+    assert c.fts5 == "grusch"
+    assert c.tags == Term("ufo", "word", "tag")
+
+
+def test_compile_tag_or() -> None:
+    c = compile_query("tag:ufo OR tag:physics")
+    assert c.fts5 is None
+    assert isinstance(c.tags, Or)
+
+
+def test_mixed_or_is_error() -> None:
+    with pytest.raises(QuerySyntaxError, match="cannot OR"):
+        compile_query("tag:ufo OR grusch")
+    with pytest.raises(QuerySyntaxError, match="cannot OR"):
+        compile_query("grusch OR tag:ufo")
+
+
+def test_partition_not_tag() -> None:
+    ast = parse_query("grusch NOT tag:ufo").ast
+    fts, tag = partition(ast)
+    assert fts == Term("grusch", "word", None)
+    assert tag == TagNot(Term("ufo", "word", "tag"))
 
 
 def test_or_not_binding() -> None:

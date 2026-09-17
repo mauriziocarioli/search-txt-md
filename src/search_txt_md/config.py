@@ -9,7 +9,7 @@ DEFAULT_ROOT = Path(
     "GoogleDrive-maurizio.carioli@gmail.com/My Drive/_Uploaded/_Podcasts"
 )
 DEFAULT_INDEX = Path.home() / "Library/Application Support/search-txt-md/index.sqlite"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SchemaError(RuntimeError):

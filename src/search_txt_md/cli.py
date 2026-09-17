@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -14,12 +15,30 @@ from search_txt_md.index import (
     init_schema,
     meta_get,
 )
-from search_txt_md.query import QuerySyntaxError, parse_query
+from search_txt_md.query import (
+    QuerySyntaxError,
+    and_tag_terms,
+    compile_query,
+)
 from search_txt_md.search import format_human, format_json, timed_search
+from search_txt_md.tags import (
+    TagError,
+    apply_tags,
+    create_tags,
+    delete_tags,
+    get_tag_id,
+    list_tags,
+    remove_tags,
+    show_tags,
+    validate_tag_name,
+)
 
 SEARCH_EPILOG = """\
 Query language: AND/OR/NOT, parentheses, "phrases", prefix*, field filters
-(title:/path:/folder:/body:). Default operator is AND. Use --or for juxtaposition.
+(title:/path:/folder:/body:/tag:). Default operator is AND. Use --or for juxtaposition.
+
+tag: filters are SQL, not FTS5. AND them with keywords; OR tags with each other.
+Cannot OR a tag: filter with a keyword.
 
 Leading-dash terms are NOT argparse flags. Pass them as a single argument or after --:
   txtmd-search 'uap -hoax'
@@ -82,6 +101,53 @@ def _search_parser() -> argparse.ArgumentParser:
     p.add_argument("--or", dest="default_or", action="store_true", help="Juxtaposition is OR")
     p.add_argument("--no-snippet", action="store_true", help="Omit snippets")
     p.add_argument("--explain", action="store_true", help="Print AST/FTS5/elapsed to stderr")
+    p.add_argument(
+        "--tag",
+        action="append",
+        default=[],
+        dest="tags",
+        metavar="NAME",
+        help="Require this tag (repeatable, AND)",
+    )
+    return p
+
+
+def _tag_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="txtmd-tag",
+        description="Create tags and apply them to indexed documents.",
+    )
+    p.add_argument("--index", type=Path, default=None, help="SQLite index path")
+    p.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="Corpus root used to resolve absolute paths",
+    )
+    sub = p.add_subparsers(dest="tag_cmd", required=True)
+
+    cr = sub.add_parser("create", help="Create tag names")
+    cr.add_argument("names", nargs="+", help="Tag names")
+
+    de = sub.add_parser("delete", help="Delete tags and their assignments")
+    de.add_argument("names", nargs="+", help="Tag names")
+
+    ls = sub.add_parser("list", help="List tags and assignment counts")
+    ls.add_argument("--json", action="store_true", help="JSON document on stdout")
+
+    ap = sub.add_parser("apply", help="Apply a tag to indexed documents")
+    ap.add_argument("name", help="Tag name")
+    ap.add_argument("paths", nargs="*", help="Document paths (index-relative or absolute)")
+    ap.add_argument("--under", default=None, help="Apply to every indexed path under DIR")
+
+    rm = sub.add_parser("remove", help="Remove a tag from documents")
+    rm.add_argument("name", help="Tag name")
+    rm.add_argument("paths", nargs="*", help="Document paths")
+    rm.add_argument("--under", default=None, help="Remove from every indexed path under DIR")
+
+    sh = sub.add_parser("show", help="List tags on a document")
+    sh.add_argument("path", help="Document path")
+    sh.add_argument("--json", action="store_true", help="JSON document on stdout")
     return p
 
 
@@ -92,6 +158,8 @@ def _dispatch_parser() -> argparse.ArgumentParser:
     idx.set_defaults(_handler="index")
     sch = sub.add_parser("search", add_help=False, parents=[_search_parser()], help="Search index")
     sch.set_defaults(_handler="search")
+    tg = sub.add_parser("tag", add_help=False, parents=[_tag_parser()], help="Manage tags")
+    tg.set_defaults(_handler="tag")
     return p
 
 
@@ -146,7 +214,8 @@ def search_main(argv: list[str] | None = None) -> int:
     parser = _search_parser()
     args = parser.parse_args(argv)
     query_text = " ".join(args.query).strip()
-    if not query_text:
+    tag_flags: list[str] = list(args.tags)
+    if not query_text and not tag_flags:
         parser.print_help()
         return 1
     if args.limit < 1 or args.limit > 10000:
@@ -157,8 +226,25 @@ def search_main(argv: list[str] | None = None) -> int:
         print(f"index not found: {settings.index}; run txtmd-index", file=sys.stderr)
         return 2
     try:
-        parsed = parse_query(query_text, default_op="OR" if args.default_or else "AND")
-        fts5 = parsed.to_fts5()
+        for name in tag_flags:
+            validate_tag_name(name)
+    except TagError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    compiled = None
+    fts5: str | None = None
+    tag_pred = None
+    default_op = "OR" if args.default_or else "AND"
+    if query_text:
+        try:
+            compiled = compile_query(query_text, default_op=default_op)
+            fts5 = compiled.fts5
+            tag_pred = compiled.tags
+        except QuerySyntaxError as exc:
+            print(f"query error: {exc}", file=sys.stderr)
+            return 1
+    try:
+        tag_pred = and_tag_terms(tag_pred, tag_flags)
     except QuerySyntaxError as exc:
         print(f"query error: {exc}", file=sys.stderr)
         return 1
@@ -176,6 +262,10 @@ def search_main(argv: list[str] | None = None) -> int:
         except SchemaError as exc:
             print(str(exc), file=sys.stderr)
             return 2
+        for name in tag_flags:
+            if get_tag_id(conn, name) is None:
+                print(f"tag not found: {name} (txtmd-tag create {name})", file=sys.stderr)
+                return 1
         stored_root = meta_get(conn, "corpus_root")
         if args.root is not None:
             corpus_root = settings.root
@@ -192,6 +282,7 @@ def search_main(argv: list[str] | None = None) -> int:
                 under=args.under,
                 corpus_root=corpus_root,
                 snippets=not args.no_snippet,
+                tag_pred=tag_pred,
             )
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
@@ -200,16 +291,145 @@ def search_main(argv: list[str] | None = None) -> int:
             print(str(exc), file=sys.stderr)
             return 1
         if args.explain:
-            print(f"default_op={parsed.default_op}", file=sys.stderr)
-            print(f"ast={parsed.ast!r}", file=sys.stderr)
+            if compiled is not None:
+                print(f"default_op={compiled.default_op}", file=sys.stderr)
+                print(f"ast={compiled.ast!r}", file=sys.stderr)
+            else:
+                print(f"default_op={default_op}", file=sys.stderr)
             print(f"fts5={fts5}", file=sys.stderr)
+            print(f"tags={tag_pred!r}", file=sys.stderr)
             print(f"elapsed_ms={elapsed_ms:.2f}", file=sys.stderr)
             print(f"hits={len(hits)}", file=sys.stderr)
         if args.json:
-            print(format_json(hits, query=query_text, fts5=fts5, limit=args.limit))
+            print(format_json(hits, query=query_text, fts5=fts5 or "", limit=args.limit))
         else:
             print(format_human(hits))
         return 0
+    finally:
+        conn.close()
+
+
+def _open_writable_index(settings: Settings) -> tuple[sqlite3.Connection | None, int | None]:
+    if not settings.index.is_file():
+        print(f"index not found: {settings.index}; run txtmd-index", file=sys.stderr)
+        return None, 2
+    try:
+        conn = connect(settings.index, writable=True)
+        init_schema(conn)
+        assert_searchable(conn)
+        return conn, None
+    except SchemaError as exc:
+        print(str(exc), file=sys.stderr)
+        return None, 2
+    except (sqlite3.Error, OSError) as exc:
+        print(f"cannot open index: {exc}", file=sys.stderr)
+        return None, 3
+
+
+def tag_main(argv: list[str] | None = None) -> int:
+    parser = _tag_parser()
+    args = parser.parse_args(argv)
+    settings = Settings.resolve(root=args.root, index=args.index)
+    conn, err = _open_writable_index(settings)
+    if err is not None:
+        return err
+    assert conn is not None
+    stored_root = meta_get(conn, "corpus_root")
+    if args.root is not None:
+        corpus_root = settings.root
+    elif stored_root:
+        corpus_root = Path(stored_root)
+    else:
+        corpus_root = None
+    try:
+        cmd = args.tag_cmd
+        if cmd == "create":
+            try:
+                changes = create_tags(conn, args.names)
+            except TagError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            conn.commit()
+            for name, action in changes:
+                print(f"{action} {name}")
+            return 0
+        if cmd == "delete":
+            try:
+                changes = delete_tags(conn, args.names)
+            except TagError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            conn.commit()
+            rc = 0
+            for name, action in changes:
+                print(f"{action} {name}")
+                if action == "missing":
+                    rc = 1
+            return rc
+        if cmd == "list":
+            rows = list_tags(conn)
+            if args.json:
+                print(
+                    json.dumps(
+                        {"tags": [{"name": n, "count": c} for n, c in rows]},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+            elif not rows:
+                print("No tags.")
+            else:
+                width = max(len(n) for n, _c in rows)
+                for name, count in rows:
+                    print(f"{name:<{width}}  {count}")
+            return 0
+        if cmd in {"apply", "remove"}:
+            if not args.paths and args.under is None:
+                print("pass PATH or --under", file=sys.stderr)
+                return 1
+            fn = apply_tags if cmd == "apply" else remove_tags
+            try:
+                changes = fn(
+                    conn,
+                    args.name,
+                    args.paths,
+                    under=args.under,
+                    corpus_root=corpus_root,
+                )
+            except TagError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            conn.commit()
+            for path, action in changes:
+                print(f"{action} {path}")
+            return 0
+        if cmd == "show":
+            try:
+                path, names = show_tags(conn, args.path, corpus_root=corpus_root)
+            except TagError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            if args.json:
+                print(
+                    json.dumps(
+                        {"path": path, "tags": names},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+            elif not names:
+                print("No tags.")
+            else:
+                print("\n".join(names))
+            return 0
+        print(f"unknown tag command {cmd!r}", file=sys.stderr)
+        return 1
+    except sqlite3.Error as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     finally:
         conn.close()
 
@@ -224,7 +444,9 @@ def main(argv: list[str] | None = None) -> int:
         return index_main(rest)
     if cmd == "search":
         return search_main(rest)
-    print(f"unknown command {cmd!r}; use index or search", file=sys.stderr)
+    if cmd == "tag":
+        return tag_main(rest)
+    print(f"unknown command {cmd!r}; use index, search, or tag", file=sys.stderr)
     return 1
 
 

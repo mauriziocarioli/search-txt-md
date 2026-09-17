@@ -11,6 +11,7 @@ from search_txt_md.index import (
     meta_get,
     require_fts5,
 )
+from search_txt_md.tags import apply_tags, create_tags, show_tags
 
 
 def _settings(corpus: Path, index_path: Path) -> Settings:
@@ -115,6 +116,60 @@ def test_full_rebuild(corpus: Path, index_path: Path) -> None:
     try:
         assert stats.upserted == 8
         assert conn.execute("SELECT count(*) FROM documents").fetchone()[0] == 8
+    finally:
+        conn.close()
+
+
+def test_full_rebuild_preserves_tags(corpus: Path, index_path: Path) -> None:
+    _stats, conn = _index(corpus, index_path, full=False, verbose=False)
+    create_tags(conn, ["ufo"])
+    apply_tags(conn, "ufo", ["UFO/Grusch-hearing.txt"])
+    conn.commit()
+    conn.close()
+    _stats, conn = _index(corpus, index_path, full=True, verbose=False)
+    try:
+        assert show_tags(conn, "UFO/Grusch-hearing.txt")[1] == ["ufo"]
+        assert conn.execute("SELECT count(*) FROM tags").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_prune_drops_tag_assignments(corpus: Path, index_path: Path) -> None:
+    _stats, conn = _index(corpus, index_path, full=False, verbose=False)
+    create_tags(conn, ["plasma"])
+    apply_tags(conn, "plasma", ["Physics/tokamak-seminar.txt"])
+    conn.commit()
+    conn.close()
+    (corpus / "Physics" / "tokamak-seminar.txt").unlink()
+    _stats, conn = _index(corpus, index_path, full=False, verbose=False)
+    try:
+        n = conn.execute("SELECT count(*) FROM document_tags").fetchone()[0]
+        assert n == 0
+        assert conn.execute("SELECT count(*) FROM tags").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_migrate_v1_to_v2(corpus: Path, index_path: Path) -> None:
+    _stats, conn = _index(corpus, index_path, full=False, verbose=False)
+    conn.execute("DROP TABLE document_tags")
+    conn.execute("DROP TABLE tags")
+    conn.execute(
+        "UPDATE index_meta SET value = '1' WHERE key = 'schema_version'"
+    )
+    conn.commit()
+    conn.close()
+    conn = connect(index_path, writable=True)
+    try:
+        init_schema(conn)
+        assert meta_get(conn, "schema_version") == "2"
+        tables = {
+            n for (n,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert "tags" in tables
+        assert "document_tags" in tables
+        n = conn.execute("SELECT count(*) FROM documents").fetchone()[0]
+        assert n == 8
     finally:
         conn.close()
 
