@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from search_txt_md.cli import index_main, search_main
+from search_txt_md.cli import index_main, search_main, tag_main
 
 
 def test_index_and_search(corpus: Path, index_path: Path, capsys) -> None:
@@ -48,6 +48,52 @@ def test_quoted_minus_query(corpus: Path, index_path: Path) -> None:
     index_main(["--root", str(corpus), "--index", str(index_path)])
     rc = search_main(["--index", str(index_path), "uap -hoax"])
     assert rc == 0
+
+
+def test_tag_cli_and_search(corpus: Path, index_path: Path, capsys) -> None:
+    assert index_main(["--root", str(corpus), "--index", str(index_path)]) == 0
+    capsys.readouterr()
+    rc = tag_main(
+        ["--index", str(index_path), "--root", str(corpus), "create", "ufo"]
+    )
+    assert rc == 0
+    assert "created ufo" in capsys.readouterr().out
+    rc = tag_main(
+        [
+            "--index",
+            str(index_path),
+            "--root",
+            str(corpus),
+            "apply",
+            "ufo",
+            "--under",
+            "UFO",
+        ]
+    )
+    assert rc == 0
+    rc = search_main(["--index", str(index_path), "--tag", "ufo", "--json"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Grusch-hearing.txt" in out
+    assert '"tags"' in out
+    rc = search_main(["--index", str(index_path), "tag:ufo", "grusch"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Grusch-hearing" in out
+    rc = search_main(["--index", str(index_path), "--tag", "nope"])
+    assert rc == 1
+
+
+def test_empty_query_with_tag(corpus: Path, index_path: Path, capsys) -> None:
+    index_main(["--root", str(corpus), "--index", str(index_path)])
+    tag_main(["--index", str(index_path), "create", "ufo"])
+    tag_main(
+        ["--index", str(index_path), "apply", "ufo", "UFO/Grusch-hearing.txt"]
+    )
+    capsys.readouterr()
+    rc = search_main(["--index", str(index_path), "--tag", "ufo"])
+    assert rc == 0
+    assert "Grusch-hearing.txt" in capsys.readouterr().out
 
 
 def test_json_flag(corpus: Path, index_path: Path, capsys) -> None:

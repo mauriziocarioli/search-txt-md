@@ -13,6 +13,7 @@ from pathlib import Path
 from search_txt_md.config import SCHEMA_VERSION, SchemaError, Settings
 from search_txt_md.crawl import iter_corpus
 from search_txt_md.extract import extract_document
+from search_txt_md.tags import prune_orphan_tags
 
 _ERROR_CAP = 20
 _CHANGE_CAP = 20
@@ -77,6 +78,7 @@ def connect(index_path: Path, *, writable: bool) -> sqlite3.Connection:
         conn.execute("PRAGMA temp_store = MEMORY")
         conn.execute("PRAGMA mmap_size = 268435456")
         conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("PRAGMA foreign_keys = ON")
         require_fts5(conn)
         return conn
     conn = sqlite3.connect(index_path)
@@ -108,6 +110,21 @@ def _documents_ddl(sql: str) -> str:
     return sql[i:]
 
 
+def tags_ddl() -> str:
+    sql = schema_sql()
+    start = sql.find("-- TAGS_BEGIN")
+    end = sql.find("-- TAGS_END")
+    if start < 0 or end < 0 or end <= start:
+        raise RuntimeError("schema.sql is missing TAGS_BEGIN/TAGS_END markers")
+    return sql[start:end]
+
+
+def migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+    conn.executescript(tags_ddl())
+    meta_set(conn, "schema_version", str(SCHEMA_VERSION))
+    conn.commit()
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     sql = schema_sql()
     tables = {
@@ -124,11 +141,19 @@ def init_schema(conn: sqlite3.Connection) -> None:
     row = conn.execute(
         "SELECT value FROM index_meta WHERE key = 'schema_version'"
     ).fetchone()
-    if row is None or int(row[0]) != SCHEMA_VERSION:
+    if row is None:
         raise SchemaError(
-            f"schema_version is {row[0] if row else 'missing'}; "
-            "run txtmd-index --full or delete the index file"
+            "schema_version is missing; run txtmd-index --full or delete the index file"
         )
+    ver = int(row[0])
+    if ver == SCHEMA_VERSION:
+        return
+    if ver == 1 and SCHEMA_VERSION == 2:
+        migrate_v1_to_v2(conn)
+        return
+    raise SchemaError(
+        f"schema_version is {ver}; run txtmd-index --full or delete the index file"
+    )
 
 
 def rebuild_documents(conn: sqlite3.Connection) -> None:
@@ -163,8 +188,16 @@ def assert_searchable(conn: sqlite3.Connection) -> None:
     row = conn.execute(
         "SELECT value FROM index_meta WHERE key = 'schema_version'"
     ).fetchone()
-    if row is None or int(row[0]) != SCHEMA_VERSION:
+    if row is None:
         raise SchemaError("schema_version mismatch; run txtmd-index --full")
+    ver = int(row[0])
+    if ver == SCHEMA_VERSION:
+        return
+    if ver == 1:
+        raise SchemaError(
+            "schema_version is 1; run txtmd-index (migrates in place, no --full needed)"
+        )
+    raise SchemaError("schema_version mismatch; run txtmd-index --full")
 
 
 def _load_existing(conn: sqlite3.Connection) -> dict[str, tuple[int, int]]:
@@ -287,6 +320,7 @@ def incremental_index(
         if writable:
             for path in pruned_paths:
                 conn.execute("DELETE FROM documents WHERE path = :path", {"path": path})
+            prune_orphan_tags(conn)
             now = datetime.now(UTC).isoformat()
             meta_set(conn, "corpus_root", str(settings.root))
             meta_set(conn, "last_run_at", now)

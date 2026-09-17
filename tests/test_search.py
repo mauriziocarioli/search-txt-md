@@ -4,8 +4,9 @@ from pathlib import Path
 
 from search_txt_md.config import Settings
 from search_txt_md.index import connect, incremental_index, init_schema
-from search_txt_md.query import parse_query
+from search_txt_md.query import compile_query, parse_query
 from search_txt_md.search import escape_like, normalize_under, search
+from search_txt_md.tags import apply_tags, create_tags
 
 
 def _build(corpus: Path, index_path: Path):
@@ -131,6 +132,54 @@ def test_title_ranks_above_body(corpus: Path, index_path: Path) -> None:
         hits = _hits(conn, "ranktoken")
         paths = [h.path for h in hits]
         assert paths.index("Rank-title.txt") < paths.index("Rank-body.txt")
+    finally:
+        conn.close()
+
+
+def _tag_hits(conn, q: str | None, **kwargs):
+    compiled = compile_query(q) if q else None
+    fts5 = compiled.fts5 if compiled else None
+    tag_pred = compiled.tags if compiled else kwargs.pop("tag_pred", None)
+    return search(
+        conn,
+        fts5,
+        limit=kwargs.pop("limit", 20),
+        ext=kwargs.get("ext"),
+        under=kwargs.get("under"),
+        corpus_root=kwargs.get("corpus_root"),
+        snippets=kwargs.get("snippets", True),
+        tag_pred=tag_pred,
+    )
+
+
+def test_search_by_tag(corpus: Path, index_path: Path) -> None:
+    conn, _ = _build(corpus, index_path)
+    try:
+        create_tags(conn, ["ufo", "physics"])
+        apply_tags(conn, "ufo", [], under="UFO")
+        apply_tags(conn, "physics", ["Physics/tokamak-seminar.txt"])
+        hits = _tag_hits(conn, "tag:ufo")
+        paths = {h.path for h in hits}
+        assert paths == {
+            "UFO/Grusch-hearing.txt",
+            "UFO/Grusch-hearing.md",
+            "UFO/Elizondo-interview.txt",
+        }
+        assert all(h.score == 0.0 for h in hits)
+        assert list(hits[0].tags)
+        hits = _tag_hits(conn, "tag:ufo grusch")
+        paths = {h.path for h in hits}
+        assert "UFO/Grusch-hearing.txt" in paths
+        assert "UFO/Elizondo-interview.txt" not in paths
+        hits = _tag_hits(conn, "tag:ufo OR tag:physics")
+        assert {h.path for h in hits} >= {
+            "UFO/Grusch-hearing.txt",
+            "Physics/tokamak-seminar.txt",
+        }
+        hits = _tag_hits(conn, "grusch NOT tag:ufo")
+        assert hits == []
+        hits = _tag_hits(conn, "tag:nope")
+        assert hits == []
     finally:
         conn.close()
 

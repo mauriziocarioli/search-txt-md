@@ -1,9 +1,25 @@
--- schema.sql  (SCHEMA_VERSION = 1)
+-- schema.sql  (SCHEMA_VERSION = 2)
 
 CREATE TABLE IF NOT EXISTS index_meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+-- TAGS_BEGIN
+CREATE TABLE IF NOT EXISTS tags (
+  id         INTEGER PRIMARY KEY,
+  name       TEXT    NOT NULL COLLATE NOCASE UNIQUE,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS document_tags (
+  path   TEXT    NOT NULL,
+  tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+  PRIMARY KEY (path, tag_id)
+);
+
+CREATE INDEX IF NOT EXISTS document_tags_tag ON document_tags(tag_id);
+-- TAGS_END
 
 CREATE TABLE documents (
   id         INTEGER PRIMARY KEY,

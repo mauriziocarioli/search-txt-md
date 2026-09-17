@@ -15,6 +15,7 @@ dev = ["pytest>=8.0", "ruff>=0.6"]
 [project.scripts]
 txtmd-index = "search_txt_md.cli:index_main"
 txtmd-search = "search_txt_md.cli:search_main"
+txtmd-tag = "search_txt_md.cli:tag_main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/search_txt_md"]
